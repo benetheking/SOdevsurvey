@@ -1,0 +1,186 @@
+---
+title: "Stack Overflow survey"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+## setup
+library(tidyverse)
+library(ranger)
+library(caret)
+library(tidymodels)
+library(workflows)
+library(tune)
+library(gbm)
+
+```
+
+## R Markdown
+
+First we need to import the data - we'll remove the ID and total compensation columns, and filter for cases where the target variable isn't missing, as it is certainly not missing completely at random.
+
+```{r data import}
+## get data
+getwd()
+setwd("C:/Users/benedikt.kreutzer/Desktop/emet")
+dat1 <- read_csv("survey_results_public.csv")
+## remove "comptotal" and "ResponseId"
+dat1 <- dat1 %>% select(-CompTotal, -ResponseId)
+## overview
+dat1 %>% names()
+dat1 %>% glimpse()
+
+## target var: “ConvertedCompYearly”
+dat1$ConvertedCompYearly # target var has NAs - remove them
+d2 <- dat1 %>% 
+  filter(!is.na(ConvertedCompYearly)) %>% 
+  filter(ConvertedCompYearly < 500000 )
+
+## look at NAs
+d2 %>% map_df(., ~sum(is.na(.x))) %>% t() %>% as.data.frame() %>% arrange(desc(V1))
+
+## let's focus on the most promising variables - good for prediction, and not too many NAs
+d3 <- d2 %>% select(ConvertedCompYearly, Country, Currency, YearsCode, YearsCodePro, EdLevel, 
+                    Age, OrgSize, LanguageHaveWorkedWith, ToolsTechHaveWorkedWith )
+## had to drop the variables c(CompFreq, MainBranch, LanguageWouldLikeWorkedWith, Employment, SOAccount)
+## the would require too much feature engineering...
+
+d3 %>% select(1:8) %>% map(.x=., ~table(.x))
+
+
+## after looking at the variables, let's do some filtering!
+d4 <- d3 %>% filter(Age != "Under 18 years old", Age != "Prefer not to say", Age != "65 years or older",
+                    OrgSize != "I don’t know", OrgSize != "Just me - I am a freelancer, sole proprietor, etc.",
+                    YearsCodePro != "Less than 1 year", YearsCodePro != "More than 50 years",
+                    YearsCode != "Less than 1 year", YearsCode != "More than 50 years")
+
+d4 %>% select(1:6) %>% map(.x=., ~table(.x))
+```
+
+## 
+
+```{r feature engineerin, echo=FALSE}
+### Feature Engineering
+## do a country filter for most numerous countries
+countr_filt <- d4 %>% select(Country) %>% count(Country) %>% arrange(n) %>% filter(n>10) %>% select(Country) %>% pull()
+
+d5 <- d4 %>% 
+  filter(Country %in% countr_filt) %>% 
+  separate(OrgSize, into = "OrgSize", sep=" ", extra = "drop") %>% 
+  separate(Age, into = "Age", sep ="-", extra = "drop") %>% 
+  mutate(Currency     = str_sub(Currency, 1, 3),
+         Currency     = ifelse(Currency == "EUR" | Currency == "USD", Currency, "OTH"),
+         Country      = str_sub(Country, 1, 5),
+         EdLevel      = str_sub(EdLevel, 1, 5),
+         YearsCode    = as.numeric(YearsCode),
+         YearsCodePro = as.numeric(YearsCodePro),
+         Age          = as.numeric(Age),
+         OrgSize      = as.numeric(str_replace(OrgSize, pattern = ",", replace ="")))
+
+d5 %>% select(ConvertedCompYearly, YearsCode, YearsCodePro, Age) %>% cor()
+d5 %>% select(Country) %>% table() %>% sort()
+
+d6 <- d5 %>% 
+  separate(LanguageHaveWorkedWith , into = c("Lang1", "Lang2", "Lang3"), sep = ";", extra = "drop") %>% 
+  separate(ToolsTechHaveWorkedWith, into = c("Tool1", "Tool2"), sep = ";", extra = "drop") %>% 
+  replace_na(replace = list(EdLevel = "none", Lang1 = "none", Lang2 = "none", Lang3 = "none", 
+                            Tool1 = "none", Tool2 = "none")) %>% 
+  mutate(Tool1 = gsub("[[:space:]]", "", Tool1),
+         Tool2 = str_replace(Tool2, " ", ""),
+         Lang1 = str_replace(Lang1, '/', "") ) 
+
+d6 %>% select(Lang1) %>% table()
+d6 %>% select(Tool1) %>% table() 
+```
+
+## ML Workflow in TIDYMODELS
+
+```{r ML workflow, echo=FALSE}
+## test-train setup
+dat_split <- initial_split(d6, prop = 0.7)
+dat_split
+# extract training and testing sets
+d_train <- training(dat_split)
+d_test <- testing(dat_split)
+d_cv <- vfold_cv(d_train, v = 5)   ## create CV object from training data
+
+# modelling setup
+d_recipe <- recipe(ConvertedCompYearly  ~ . ,  data = dat_split) %>% ## this is the model equation
+  step_normalize(all_numeric()) %>%
+  step_impute_knn(EdLevel) ## don't have any NAs in this dataset, but could easily knn-impute them here
+
+d_recipe <- recipe(ConvertedCompYearly  ~ . ,  data = d6)
+
+## set up Random Forest
+rf_model <- rand_forest() %>%
+  set_args(mtry = tune(), trees = tune()) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("regression") 
+## GBM ??
+#gbm_model <- logistic_reg() %>%
+#  set_engine("glm") %>%
+#  set_mode("classification") 
+
+# set the workflow
+rf_workflow <- workflow() %>%
+  add_recipe(d_recipe) %>%
+  add_model(rf_model)
+
+# specify mtry values
+# rf_grid <- expand.grid(mtry = c(2, 3, 4, 5), trees = c(250, 500))
+rf_grid <- expand.grid(mtry = c(3, 5, 7, 9), trees = c(200, 500))
+rf_grid
+rf_tune_results <- rf_workflow %>%
+  tune_grid(resamples = d_cv,
+            grid = rf_grid, # grid of values to try
+            metrics = metric_set(rmse, rsq) # metrics we care about
+  )
+
+# print results
+rf_tune_results %>% collect_metrics()
+
+rf_fit <- rf_workflow %>%
+  last_fit(dat_split)
+## running into some odd error here!
+```
+
+
+## Different direct training approach here
+
+```{r pressure, echo=FALSE}
+splitter <- sample(1:nrow(d6), size = 0.7*nrow(d6))
+trainer <- d6[splitter,]
+tester <- d6[-splitter,]
+
+## Random Forest
+easy_model <- ranger(ConvertedCompYearly  ~ ., data = trainer, mtry = 9, num.trees = 500)
+easy_model2 <- ranger(ConvertedCompYearly  ~ Currency + YearsCode + YearsCodePro + Age, data = trainer, mtry = 2, num.trees = 500)
+easy_model2
+predicter <- predict(easy_model, tester)
+
+cor(predicter$predictions, tester$ConvertedCompYearly)^2 ## Rsq
+
+
+easy_model2 <- ranger(ConvertedCompYearly ~ Currency + YearsCode + YearsCodePro + Age + OrgSize, 
+                      data = trainer, mtry = 2, num.trees = 500)
+easy_model2
+
+## GBM model
+easy_model_gbm <- gbm::gbm(ConvertedCompYearly ~ as.factor(Currency) + YearsCode + YearsCodePro + Age + OrgSize, 
+                           data = trainer, distribution = "gaussian", n.trees = 10000, verbose = T, 
+                           interaction.depth = 5, shrinkage = 0.0002)
+gbm.perf(easy_model_gbm, oobag.curve = T)
+bla <- predict(easy_model_gbm, tester)
+
+cor(bla, tester$ConvertedCompYearly)^2 ## Rsq
+```
+
+
+## 
+
+```{r pressure, echo=FALSE}
+
+```
+
